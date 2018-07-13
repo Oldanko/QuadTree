@@ -6,10 +6,156 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <memory>
+#include <map>
+#include <algorithm>
 
 using namespace std;
 
 GLuint LoadShaders(const char * vertex_file_path,const char * fragment_file_path);
+
+struct point
+{
+  static constexpr float radius = 0.01f;
+  float x, y;
+  float vx, vy;
+};
+
+std::vector<point> points;
+
+struct QuadTree
+{
+  unique_ptr<QuadTree> kids[4];
+  QuadTree* dad;
+  static const int max = 2;
+  static const int lvls = 5;
+  int lvl;
+  map<int, int> ids;
+
+  float x, y;
+  float size;
+  bool subdivided = false;
+
+  QuadTree(float x = 0, float y = 0, float size = 1, int lvl = 0, QuadTree* dad = nullptr) : x(x), y(y), size(size), lvl(lvl), dad(dad) {}
+
+  void addPoint(int id)
+  {
+    ids[id] = -1;
+
+    if(ids.size() >= max)
+    {
+      if (lvl >= lvls) return;
+      auto insert = [this](int id)
+      {
+        int pos = 0;
+        if(points[id].x > x) pos+=1;
+        if(points[id].y < y) pos+=2;
+        kids[pos]->addPoint(id);
+        ids[id] = pos;
+      };
+
+      if(subdivided)
+      {
+       insert(id);
+       return;
+      }
+      subdivide();
+      for(auto it = ids.begin(); it != ids.end(); it++) insert(it->first);
+    }
+  }
+
+  void subdivide()
+  {
+    if(subdivided) return;
+    float _size = size/2;
+    kids[0] = make_unique<QuadTree>(QuadTree(x - _size, y + _size, _size, lvl+1, this));
+    kids[1] = make_unique<QuadTree>(QuadTree(x + _size, y + _size, _size, lvl+1, this));
+    kids[2] = make_unique<QuadTree>(QuadTree(x - _size, y - _size, _size, lvl+1, this));
+    kids[3] = make_unique<QuadTree>(QuadTree(x + _size, y - _size, _size, lvl+1, this));
+    subdivided = true;
+  }
+
+  void render()
+  {
+    if(subdivided)
+    {
+      glUniform3f(0, x, y, size);
+      glDrawArrays(GL_LINES, 0, 4);
+      for(auto& kid : kids)
+        kid->render();
+    }
+  }
+
+  bool within(int id)
+  {
+    if(dad == nullptr) return true;
+    return
+    points[id].x < x + size &&
+    points[id].x > x - size &&
+    points[id].y < y + size &&
+    points[id].y > y - size;
+
+  }
+
+  void merge()
+  {
+    subdivided = false;
+    for(auto& k : kids)
+      k = nullptr;
+  }
+
+  vector<int> reduce()
+  {
+    std::vector<int> v;
+    if(!subdivided)
+    {
+      for(auto it = ids.begin(); it != ids.end(); it++)
+        if(!within(it->first))
+        {
+          v.push_back(it->first);
+          ids.erase(it->first);
+        }
+      return v;
+    }
+
+    for(auto& kid : kids){
+        for(auto r : kid->reduce())
+        {
+          if(within(r)) addPoint(r);
+          else
+          {
+            v.push_back(r);
+            ids.erase(r);
+          }
+        }
+    }
+
+    if(ids.size() < max)
+      merge();
+    return v;
+  }
+};
+
+
+QuadTree tree;
+
+point cursor;
+
+void update(point& p)
+{
+  p.x += p.vx;
+  p.y += p.vy;
+  if(p.x <= -1 || p.x >= 1) p.vx *= -1;
+  if(p.y <= -1 || p.y >= 1) p.vy *= -1;
+  p.x += p.vx;
+  p.y += p.vy;
+}
+
+void render(point& p)
+{
+  glUniform3f(0, p.x, p.y, point::radius);
+  glDrawArrays(GL_TRIANGLE_FAN, 0, 14);
+}
 
 int main(int argc, char**argv)
 {
@@ -29,7 +175,7 @@ int main(int argc, char**argv)
     glfwTerminate();
     return -1;
   }
-  glfwSwapInterval(1);
+  //glfwSwapInterval(1);
   glfwMakeContextCurrent(window);
 
   glewExperimental = GL_TRUE;
@@ -41,9 +187,29 @@ int main(int argc, char**argv)
     return -1;
   }
 
-  cout << "Before vao init" << endl;
+  GLuint program = LoadShaders(
+    "res/shaders/def_vertex.c",
+    "res/shaders/def_fragment.c"
+  );
+  GLuint program_grid = LoadShaders(
+    "res/shaders/grid_vertex.c",
+    "res/shaders/grid_fragment.c"
+  );
 
-  GLuint vao, vbo;
+  GLuint program_circle = LoadShaders(
+    "res/shaders/circle_vertex.c",
+    "res/shaders/circle_fragment.c"
+  );
+
+  glUseProgram(program_grid);
+  glUniform3f(0, 0.0, 0.0, 1.0);
+  glUseProgram(program_circle);
+  glUniform3f(0, 0.0, 0.0, .05);
+
+  GLuint vao[2], vbo;
+
+  glGenVertexArrays(2, vao);
+  glBindVertexArray(vao[0]);
 
   float triangle[] =
   {
@@ -51,15 +217,6 @@ int main(int argc, char**argv)
     1.0f, -1.0f, 0.0f,
     0.0f,  1.0f, 0.0f,
   };
-
-  GLuint program = LoadShaders(
-    "res/shaders/def_vertex.c",
-    "res/shaders/def_fragment.c"
-  );
-
-  glUseProgram(program);
-  glGenVertexArrays(1, &vao);
-  glBindVertexArray(vao);
 
   glGenBuffers(1, &vbo);
   glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -75,22 +232,57 @@ int main(int argc, char**argv)
      0,
      (void*)0
   );
+  glClearColor(1,1,1,1);
 
   while(!glfwWindowShouldClose(window))
   {
-    glBindVertexArray(vao);
+    double xpos, ypos;
+    glfwGetCursorPos(window, &xpos, &ypos);
+    cursor.x = (float)xpos/640*2 - 1.0f;
+    cursor.y = 1.0f - (float)ypos/480*2;
 
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    static bool clicked = false;
+    if(glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
+    {
+      if(!clicked)
+      {
+        points.push_back(point{
+          cursor.x,
+          cursor.y,
+          rand() % 101 / 10000.0f - 0.005f,
+          rand() % 101 / 10000.0f - 0.005f
+        });
+        tree.addPoint(points.size()-1);
+        clicked = true;
+      }
+    }
+    else clicked = false;
 
-    glBindVertexArray(0);
+    for(auto & p : points) update(p);
+    if(0 != tree.reduce().size())
+    cout << "Loose balls" << endl;
+
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glBindVertexArray(vao[1]);
+
+    glUseProgram(program_grid);
+
+    tree.render();
+
+    glUseProgram(program_circle);
+    render(cursor);
+    for(auto & p : points) render(p);
 
     glfwSwapBuffers(window);
     glfwPollEvents();
   }
 
 
-  glDeleteVertexArrays(1, &vao);
+  glDeleteVertexArrays(2, vao);
   glDeleteProgram(program);
+  glDeleteProgram(program_grid);
+  glDeleteProgram(program_circle);
   glfwDestroyWindow(window);
   glfwTerminate();
   return 0;
